@@ -1181,7 +1181,7 @@ void database::perform_chain_maintenance(const signed_block& next_block, const g
                                          const detail::vote_decay_options& opt,
                                          const detail::vote_decay_times& decay_times ) const
       {
-         if( last_vote_time >= decay_times.full_power_time )
+         if( last_vote_time > decay_times.full_power_time )
             return stake;
          if( last_vote_time <= decay_times.zero_power_time )
             return 0;
