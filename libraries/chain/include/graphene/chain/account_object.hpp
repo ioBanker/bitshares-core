@@ -197,6 +197,9 @@ namespace graphene { namespace chain {
          typedef account_options  options_type;
          account_options options;
 
+         /// Pre-calculated for better performance on chain maintenance
+         uint16_t num_committee_voted;
+
          /// The reference implementation records the account's statistics in a separate object. This field contains the
          /// ID of that object.
          account_statistics_id_type statistics;

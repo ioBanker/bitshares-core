@@ -1227,6 +1227,8 @@ void database::perform_chain_maintenance(const signed_block& next_block, const g
                                           detail::vote_decay_options::witness(), *witness_decay_times );
                voting_stake[0] = get_decayed_voting_stake( voting_stake[2], opinion_account_stats.last_vote_time,
                                           detail::vote_decay_options::committee(), *committee_decay_times );
+               if( opinion_account.num_committee_voted > 1 )
+                  voting_stake[0] /= opinion_account.num_committee_voted;
             }
 
             for( vote_id_type id : opinion_account.options.votes )
