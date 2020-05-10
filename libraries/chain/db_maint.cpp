@@ -1104,7 +1104,7 @@ namespace detail {
       vote_decay_options( uint32_t f, uint32_t d, uint32_t s )
       : full_power_seconds(f), decay_steps(d), seconds_per_step(s)
       {
-         total_decay_seconds = decay_steps * seconds_per_step; // should not overflow
+         total_decay_seconds = ( decay_steps - 1 ) * seconds_per_step; // should not overflow
          power_percents_to_subtract.reserve( decay_steps - 1 );
          for( uint32_t i = 1; i < decay_steps; ++i )
             power_percents_to_subtract.push_back( GRAPHENE_100_PERCENT * i / decay_steps ); // should not overflow
