@@ -202,7 +202,7 @@ void database::pay_workers( share_type& budget )
 void database::update_active_witnesses()
 { try {
    assert( _witness_count_histogram_buffer.size() > 0 );
-   share_type stake_target = (_total_voting_stake-_witness_count_histogram_buffer[0]) / 2;
+   share_type stake_target = (_total_voting_stake[1]-_witness_count_histogram_buffer[0]) / 2;
 
    /// accounts that vote for 0 or 1 witness do not get to express an opinion on
    /// the number of witnesses to have (they abstain and are non-voting accounts)
@@ -304,7 +304,7 @@ void database::update_active_witnesses()
 void database::update_active_committee_members()
 { try {
    assert( _committee_count_histogram_buffer.size() > 0 );
-   share_type stake_target = (_total_voting_stake-_committee_count_histogram_buffer[0]) / 2;
+   share_type stake_target = (_total_voting_stake[0]-_committee_count_histogram_buffer[0]) / 2;
 
    /// accounts that vote for 0 or 1 committee member do not get to express an opinion on
    /// the number of committee members to have (they abstain and are non-voting accounts)
@@ -1091,6 +1091,58 @@ void delete_expired_custom_authorities( database& db )
       db.remove(*index.begin());
 }
 
+namespace detail {
+
+   struct vote_decay_times
+   {
+      time_point_sec full_power_time;
+      time_point_sec zero_power_time;
+   };
+
+   struct vote_decay_options
+   {
+      vote_decay_options( uint32_t f, uint32_t d, uint32_t s )
+      : full_power_seconds(f), decay_steps(d), seconds_per_step(s)
+      {
+         total_decay_seconds = decay_steps * seconds_per_step; // should not overflow
+         power_percents_to_subtract.reserve( decay_steps - 1 );
+         for( uint32_t i = 1; i < decay_steps; ++i )
+            power_percents_to_subtract.push_back( GRAPHENE_100_PERCENT * i / decay_steps ); // should not overflow
+      }
+
+      vote_decay_times get_vote_decay_times( const time_point_sec now ) const
+      {
+         return { now - full_power_seconds, now - full_power_seconds - total_decay_seconds };
+      }
+
+      uint32_t full_power_seconds;
+      uint32_t decay_steps; // >= 1
+      uint32_t seconds_per_step;
+      uint32_t total_decay_seconds;
+      vector<uint16_t> power_percents_to_subtract;
+
+      static const vote_decay_options witness();
+      static const vote_decay_options committee();
+      static const vote_decay_options delegator();
+   };
+
+   const vote_decay_options vote_decay_options::witness()
+   {
+      static const vote_decay_options o( 360*86400, 8, 45*86400 );
+      return o;
+   }
+   const vote_decay_options vote_decay_options::committee()
+   {
+      static const vote_decay_options o( 360*86400, 8, 45*86400 );
+      return o;
+   }
+   const vote_decay_options vote_decay_options::delegator()
+   {
+      static const vote_decay_options o( 360*86400, 8, 45*86400 );
+      return o;
+   }
+}
+
 void database::perform_chain_maintenance(const signed_block& next_block, const global_property_object& global_props)
 {
    const auto& gpo = get_global_properties();
@@ -1101,64 +1153,106 @@ void database::perform_chain_maintenance(const signed_block& next_block, const g
    struct vote_tally_helper {
       database& d;
       const global_property_object& props;
+      const time_point_sec now;
+      const bool bsip22_passed;
+
+      optional<detail::vote_decay_times> witness_decay_times;
+      optional<detail::vote_decay_times> committee_decay_times;
+      optional<detail::vote_decay_times> delegator_decay_times;
 
       vote_tally_helper(database& d, const global_property_object& gpo)
-         : d(d), props(gpo)
+         : d(d), props(gpo), now( d.head_block_time() ), bsip22_passed( HARDFORK_BSIP_22_PASSED( now ) )
       {
          d._vote_tally_buffer.resize(props.next_available_vote_id);
          d._witness_count_histogram_buffer.resize(props.parameters.maximum_witness_count / 2 + 1);
          d._committee_count_histogram_buffer.resize(props.parameters.maximum_committee_count / 2 + 1);
-         d._total_voting_stake = 0;
+         d._total_voting_stake[0] = 0;
+         d._total_voting_stake[1] = 0;
+         if( bsip22_passed )
+         {
+            witness_decay_times   = detail::vote_decay_options::witness().get_vote_decay_times( now );
+            committee_decay_times = detail::vote_decay_options::committee().get_vote_decay_times( now );
+            delegator_decay_times = detail::vote_decay_options::delegator().get_vote_decay_times( now );
+         }
+      }
+
+      // return the stake that is "decayed to X"
+      uint64_t get_decayed_voting_stake( const uint64_t stake, const time_point_sec last_vote_time,
+                                         const detail::vote_decay_options& opt,
+                                         const detail::vote_decay_times& decay_times ) const
+      {
+         if( last_vote_time >= decay_times.full_power_time )
+            return stake;
+         if( last_vote_time <= decay_times.zero_power_time )
+            return 0;
+         uint32_t diff = decay_times.full_power_time.sec_since_epoch() - last_vote_time.sec_since_epoch();
+         uint32_t steps_to_subtract_minus_1 = diff / opt.seconds_per_step;
+         fc::uint128_t stake_to_subtract( stake );
+         stake_to_subtract *= opt.power_percents_to_subtract[steps_to_subtract_minus_1];
+         stake_to_subtract /= GRAPHENE_100_PERCENT;
+         return stake - static_cast<uint64_t>(stake_to_subtract);
       }
 
       void operator()( const account_object& stake_account, const account_statistics_object& stats )
       {
-         if( props.parameters.count_non_member_votes || stake_account.is_member(d.head_block_time()) )
+         if( props.parameters.count_non_member_votes || stake_account.is_member( now ) )
          {
             // There may be a difference between the account whose stake is voting and the one specifying opinions.
-            // Usually they're the same, but if the stake account has specified a voting_account, that account is the one
-            // specifying the opinions.
-            const account_object& opinion_account =
-                  (stake_account.options.voting_account ==
-                   GRAPHENE_PROXY_TO_SELF_ACCOUNT)? stake_account
-                                     : d.get(stake_account.options.voting_account);
+            // Usually they're the same, but if the stake account has specified a voting_account, that account is the
+            // one specifying the opinions.
+            bool directly_voting = ( stake_account.options.voting_account == GRAPHENE_PROXY_TO_SELF_ACCOUNT );
+            const account_object& opinion_account = ( directly_voting ? stake_account
+                                                      : d.get(stake_account.options.voting_account) );
 
-            uint64_t voting_stake = stats.total_core_in_orders.value
+            uint64_t voting_stake[3]; // 0=committee, 1=witness, 2=worker, as in vote_id_type::vote_type
+            voting_stake[2] = stats.total_core_in_orders.value
                   + (stake_account.cashback_vb.valid() ? (*stake_account.cashback_vb)(d).balance.amount.value: 0)
                   + stats.core_in_balance.value;
+
+            if( !bsip22_passed )
+            {
+               voting_stake[0] = voting_stake[2];
+               voting_stake[1] = voting_stake[2];
+            }
+            else
+            {
+               if( !directly_voting )
+               {
+                  voting_stake[2] = get_decayed_voting_stake( voting_stake[2], stats.last_vote_time,
+                                          detail::vote_decay_options::delegator(), *delegator_decay_times );
+               }
+               const account_statistics_object& opinion_account_stats = ( directly_voting ? stats
+                                          : opinion_account.statistics( d ) );
+               voting_stake[1] = get_decayed_voting_stake( voting_stake[2], opinion_account_stats.last_vote_time,
+                                          detail::vote_decay_options::witness(), *witness_decay_times );
+               voting_stake[0] = get_decayed_voting_stake( voting_stake[2], opinion_account_stats.last_vote_time,
+                                          detail::vote_decay_options::committee(), *committee_decay_times );
+            }
 
             for( vote_id_type id : opinion_account.options.votes )
             {
                uint32_t offset = id.instance();
+               uint32_t type = std::min( id.type(), vote_id_type::vote_type::worker ); // cap the data
                // if they somehow managed to specify an illegal offset, ignore it.
                if( offset < d._vote_tally_buffer.size() )
-                  d._vote_tally_buffer[offset] += voting_stake;
+                  d._vote_tally_buffer[offset] += voting_stake[type];
             }
 
+            // votes for a number greater than maximum_witness_count are skipped here
             if( opinion_account.options.num_witness <= props.parameters.maximum_witness_count )
             {
-               uint16_t offset = std::min(size_t(opinion_account.options.num_witness/2),
-                                          d._witness_count_histogram_buffer.size() - 1);
-               // votes for a number greater than maximum_witness_count
-               // are turned into votes for maximum_witness_count.
-               //
-               // in particular, this takes care of the case where a
-               // member was voting for a high number, then the
-               // parameter was lowered.
-               d._witness_count_histogram_buffer[offset] += voting_stake;
+               uint16_t offset = opinion_account.options.num_witness / 2;
+               d._witness_count_histogram_buffer[offset] += voting_stake[1];
             }
+            // votes for a number greater than maximum_committee_count are skipped here
             if( opinion_account.options.num_committee <= props.parameters.maximum_committee_count )
             {
-               uint16_t offset = std::min(size_t(opinion_account.options.num_committee/2),
-                                          d._committee_count_histogram_buffer.size() - 1);
-               // votes for a number greater than maximum_committee_count
-               // are turned into votes for maximum_committee_count.
-               //
-               // same rationale as for witnesses
-               d._committee_count_histogram_buffer[offset] += voting_stake;
+               uint16_t offset = opinion_account.options.num_committee / 2;
+               d._committee_count_histogram_buffer[offset] += voting_stake[0];
             }
 
-            d._total_voting_stake += voting_stake;
+            d._total_voting_stake[0] += voting_stake[0];
+            d._total_voting_stake[1] += voting_stake[1];
          }
       }
    } tally_helper(*this, gpo);
