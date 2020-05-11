@@ -1125,6 +1125,22 @@ namespace detail {
       static const vote_decay_options committee();
       static const vote_decay_options worker();
       static const vote_decay_options delegator();
+
+      // return the stake that is "decayed to X"
+      uint64_t get_decayed_voting_stake( const uint64_t stake, const time_point_sec last_vote_time,
+                                         const vote_decay_times& decay_times ) const
+      {
+         if( last_vote_time > decay_times.full_power_time )
+            return stake;
+         if( last_vote_time <= decay_times.zero_power_time )
+            return 0;
+         uint32_t diff = decay_times.full_power_time.sec_since_epoch() - last_vote_time.sec_since_epoch();
+         uint32_t steps_to_subtract_minus_1 = diff / seconds_per_step;
+         fc::uint128_t stake_to_subtract( stake );
+         stake_to_subtract *= power_percents_to_subtract[steps_to_subtract_minus_1];
+         stake_to_subtract /= GRAPHENE_100_PERCENT;
+         return stake - static_cast<uint64_t>(stake_to_subtract);
+      }
    };
 
    const vote_decay_options vote_decay_options::witness()
@@ -1184,23 +1200,6 @@ void database::perform_chain_maintenance(const signed_block& next_block, const g
          }
       }
 
-      // return the stake that is "decayed to X"
-      uint64_t get_decayed_voting_stake( const uint64_t stake, const time_point_sec last_vote_time,
-                                         const detail::vote_decay_options& opt,
-                                         const detail::vote_decay_times& decay_times ) const
-      {
-         if( last_vote_time > decay_times.full_power_time )
-            return stake;
-         if( last_vote_time <= decay_times.zero_power_time )
-            return 0;
-         uint32_t diff = decay_times.full_power_time.sec_since_epoch() - last_vote_time.sec_since_epoch();
-         uint32_t steps_to_subtract_minus_1 = diff / opt.seconds_per_step;
-         fc::uint128_t stake_to_subtract( stake );
-         stake_to_subtract *= opt.power_percents_to_subtract[steps_to_subtract_minus_1];
-         stake_to_subtract /= GRAPHENE_100_PERCENT;
-         return stake - static_cast<uint64_t>(stake_to_subtract);
-      }
-
       void operator()( const account_object& stake_account, const account_statistics_object& stats )
       {
          if( props.parameters.count_non_member_votes || stake_account.is_member( now ) )
@@ -1226,19 +1225,19 @@ void database::perform_chain_maintenance(const signed_block& next_block, const g
             {
                if( !directly_voting )
                {
-                  voting_stake[2] = get_decayed_voting_stake( voting_stake[2], stats.last_vote_time,
-                                          detail::vote_decay_options::delegator(), *delegator_decay_times );
+                  voting_stake[2] = detail::vote_decay_options::delegator().get_decayed_voting_stake(
+                                          voting_stake[2], stats.last_vote_time, *delegator_decay_times );
                }
                const account_statistics_object& opinion_account_stats = ( directly_voting ? stats
                                           : opinion_account.statistics( d ) );
-               voting_stake[1] = get_decayed_voting_stake( voting_stake[2], opinion_account_stats.last_vote_time,
-                                          detail::vote_decay_options::witness(), *witness_decay_times );
-               voting_stake[0] = get_decayed_voting_stake( voting_stake[2], opinion_account_stats.last_vote_time,
-                                          detail::vote_decay_options::committee(), *committee_decay_times );
+               voting_stake[1] = detail::vote_decay_options::witness().get_decayed_voting_stake(
+                                    voting_stake[2], opinion_account_stats.last_vote_time, *witness_decay_times );
+               voting_stake[0] = detail::vote_decay_options::committee().get_decayed_voting_stake(
+                                    voting_stake[2], opinion_account_stats.last_vote_time, *committee_decay_times );
                if( opinion_account.num_committee_voted > 1 )
                   voting_stake[0] /= opinion_account.num_committee_voted;
-               voting_stake[2] = get_decayed_voting_stake( voting_stake[2], opinion_account_stats.last_vote_time,
-                                          detail::vote_decay_options::worker(), *worker_decay_times );
+               voting_stake[2] = detail::vote_decay_options::worker().get_decayed_voting_stake(
+                                    voting_stake[2], opinion_account_stats.last_vote_time, *worker_decay_times );
             }
 
             for( vote_id_type id : opinion_account.options.votes )
