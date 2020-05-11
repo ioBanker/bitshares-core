@@ -1123,6 +1123,7 @@ namespace detail {
 
       static const vote_decay_options witness();
       static const vote_decay_options committee();
+      static const vote_decay_options worker();
       static const vote_decay_options delegator();
    };
 
@@ -1132,6 +1133,11 @@ namespace detail {
       return o;
    }
    const vote_decay_options vote_decay_options::committee()
+   {
+      static const vote_decay_options o( 360*86400, 8, 45*86400 );
+      return o;
+   }
+   const vote_decay_options vote_decay_options::worker()
    {
       static const vote_decay_options o( 360*86400, 8, 45*86400 );
       return o;
@@ -1158,20 +1164,22 @@ void database::perform_chain_maintenance(const signed_block& next_block, const g
 
       optional<detail::vote_decay_times> witness_decay_times;
       optional<detail::vote_decay_times> committee_decay_times;
+      optional<detail::vote_decay_times> worker_decay_times;
       optional<detail::vote_decay_times> delegator_decay_times;
 
       vote_tally_helper(database& d, const global_property_object& gpo)
          : d(d), props(gpo), now( d.head_block_time() ), bsip22_passed( HARDFORK_BSIP_22_PASSED( now ) )
       {
-         d._vote_tally_buffer.resize(props.next_available_vote_id);
-         d._witness_count_histogram_buffer.resize(props.parameters.maximum_witness_count / 2 + 1);
-         d._committee_count_histogram_buffer.resize(props.parameters.maximum_committee_count / 2 + 1);
+         d._vote_tally_buffer.resize( props.next_available_vote_id, 0 );
+         d._witness_count_histogram_buffer.resize( props.parameters.maximum_witness_count / 2 + 1, 0 );
+         d._committee_count_histogram_buffer.resize( props.parameters.maximum_committee_count / 2 + 1, 0 );
          d._total_voting_stake[0] = 0;
          d._total_voting_stake[1] = 0;
          if( bsip22_passed )
          {
             witness_decay_times   = detail::vote_decay_options::witness().get_vote_decay_times( now );
             committee_decay_times = detail::vote_decay_options::committee().get_vote_decay_times( now );
+            worker_decay_times    = detail::vote_decay_options::worker().get_vote_decay_times( now );
             delegator_decay_times = detail::vote_decay_options::delegator().get_vote_decay_times( now );
          }
       }
@@ -1229,6 +1237,8 @@ void database::perform_chain_maintenance(const signed_block& next_block, const g
                                           detail::vote_decay_options::committee(), *committee_decay_times );
                if( opinion_account.num_committee_voted > 1 )
                   voting_stake[0] /= opinion_account.num_committee_voted;
+               voting_stake[2] = get_decayed_voting_stake( voting_stake[2], opinion_account_stats.last_vote_time,
+                                          detail::vote_decay_options::worker(), *worker_decay_times );
             }
 
             for( vote_id_type id : opinion_account.options.votes )
