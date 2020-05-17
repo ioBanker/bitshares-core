@@ -482,8 +482,9 @@ bool database::apply_order(const limit_order_object& new_order_object, bool allo
           && !sell_abd->has_settlement()
           && !sell_abd->current_feed.settlement_price.is_null() )
       {
-         // TODO: BSIP74: Change the call_match_price = settlement_price/(MSSR-MCFR)
-         call_match_price = ~get_max_short_squeeze_price( maint_time, sell_abd->current_feed );
+         // BSIP74: Change the call_match_price = settlement_price/(MSSR-MCFR)
+         call_match_price = ~get_max_short_squeeze_price(head_block_time(), maint_time, sell_abd->current_feed,
+                                                         sell_abd->options.extensions.value.margin_call_fee_ratio);
          if( ~new_order_object.sell_price <= call_match_price ) // new limit order price is good enough to match a call
             to_check_call_orders = true;
       }
@@ -1068,15 +1069,38 @@ bool database::fill_settle_order( const force_settlement_object& settle, const a
 /***
  * Get the correct max_short_squeeze_price from the price_feed based on chain time
  * (due to hardfork changes in the calculation)
- * @param block_time the chain's current block time
+ * @param head_block_time The chain's current block time
+ * @param next_maintenance_time The chain's next maintenance time
  * @param feed the debt asset's price feed
+ * @param margin_call_fee_ratio The MCFR for the debt asset in the respective price feed
  * @returns the max short squeeze price
  */
-price database::get_max_short_squeeze_price( const fc::time_point_sec& block_time, const price_feed& feed)const
+price database::get_max_short_squeeze_price(const fc::time_point_sec& head_block_time,
+                                            const fc::time_point_sec& next_maintenance_time,
+                                            const price_feed& feed,
+                                            const fc::optional<uint16_t> margin_call_fee_ratio) const
 {
-   if ( block_time <= HARDFORK_CORE_1270_TIME )
+   if ( next_maintenance_time <= HARDFORK_CORE_1270_TIME ) {
       return feed.max_short_squeeze_price_before_hf_1270();
-   return feed.max_short_squeeze_price();
+   } else if (head_block_time <= HARDFORK_CORE_BSIP74_TIME) {
+      return feed.max_short_squeeze_price();
+   } else {
+      // After BSIP74: Max. Short Squeeze Price = settlement_price / (MSSR - MCFR)
+      // 1 <= MSSR-MCFR < MCR according to https://github.com/bitshares/bsips/pull/273
+      const uint16_t mssr = feed.maximum_short_squeeze_ratio; // TODO: BSIP75 should update this line
+      const uint16_t mcfr = margin_call_fee_ratio.valid() ? *margin_call_fee_ratio : 0;
+
+      // Mathematically floor the difference at 1
+      // Expressed in this codebase: floor the value at GRAPHENE_COLLATERAL_RATIO_DENOM
+      const uint16_t delta = mssr > mcfr ? (mssr - mcfr) : GRAPHENE_COLLATERAL_RATIO_DENOM;
+      if (delta > GRAPHENE_COLLATERAL_RATIO_DENOM) {
+         return feed.settlement_price * ratio_type( GRAPHENE_COLLATERAL_RATIO_DENOM, delta);
+
+      } else {
+         // Optimization: The effect of mathematically flooring at 1 is to return the settlement_price
+         return feed.settlement_price;
+      }
+   }
 }
 
 /**
@@ -1127,8 +1151,9 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
     // looking for limit orders selling the most USD for the least CORE
     auto max_price = price::max( mia.id, bitasset.options.short_backing_asset );
     // stop when limit orders are selling too little USD for too much CORE
-    // TODO: BSIP74: Change the min_price = feed_price / (MSSR-MCFR) (instead of the current feed_price / MSSR)
-    auto min_price = get_max_short_squeeze_price( maint_time, bitasset.current_feed);
+    // BSIP74: Change the min_price = feed_price / (MSSR-MCFR) (instead of the current feed_price / MSSR)
+    auto min_price = get_max_short_squeeze_price(head_block_time(), maint_time, bitasset.current_feed,
+                                                 bitasset.options.extensions.value.margin_call_fee_ratio);
 
     // NOTE limit_price_index is sorted from greatest to least
     auto limit_itr = limit_price_index.lower_bound( max_price );
