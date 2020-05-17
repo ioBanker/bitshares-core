@@ -813,12 +813,7 @@ bool database::fill_limit_order( const limit_order_object& order, const asset& p
 
    const account_object& seller = order.seller(*this);
 
-   // TODO: Revert the following code to before BSIP74: limit order does not pay extra
-   asset issuer_fees;
-   if (!is_maker && is_margin_call)
-      issuer_fees = pay_margin_fees(pays.asset_id(*this), receives );
-   else
-      issuer_fees = pay_market_fees(&seller, receives.asset_id(*this), receives, is_maker);
+   const auto issuer_fees = pay_market_fees(&seller, receives.asset_id(*this), receives, is_maker);
 
    pay_order( seller, receives - issuer_fees, pays );
 
