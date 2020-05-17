@@ -48,7 +48,7 @@ namespace detail {
    share_type calculate_ratio( const share_type& value, uint16_t ratio)
    {
       fc::uint128_t a(value.value);
-      a *= (ratio-GRAPHENE_COLLATERAL_RATIO_DENOM);
+      a *= (ratio > GRAPHENE_COLLATERAL_RATIO_DENOM) ? (ratio-GRAPHENE_COLLATERAL_RATIO_DENOM) : 0; // Avoid underflows
       a /= GRAPHENE_COLLATERAL_RATIO_DENOM;
       return static_cast<int64_t>(a);
    }
@@ -482,6 +482,7 @@ bool database::apply_order(const limit_order_object& new_order_object, bool allo
           && !sell_abd->has_settlement()
           && !sell_abd->current_feed.settlement_price.is_null() )
       {
+         // TODO: BSIP74: Change the call_match_price = settlement_price/(MSSR-MCFR)
          call_match_price = ~get_max_short_squeeze_price( maint_time, sell_abd->current_feed );
          if( ~new_order_object.sell_price <= call_match_price ) // new limit order price is good enough to match a call
             to_check_call_orders = true;
@@ -686,11 +687,13 @@ int database::match( const limit_order_object& bid, const call_order_object& ask
       order_receives = usd_to_buy.multiply_and_round_up( match_price ); // round up here, in favor of limit order
    }
 
+   // TODO: BSIP74: Call order must pay X*MSSR/feed_price > match_price = X*(MSSR-MCFR)/feed_price
    call_pays  = order_receives;
    order_pays = call_receives;
 
    int result = 0;
    result |= fill_limit_order( bid, order_pays, order_receives, cull_taker, match_price, false, true );
+   // TODO: BSIP74: Pass the calculated margin call fee into fill_call_order()
    result |= fill_call_order( ask, call_pays, call_receives, match_price, true ) << 1;      // the call order is maker
    // result can be 0 when call order has target_collateral_ratio option set.
 
@@ -809,6 +812,7 @@ bool database::fill_limit_order( const limit_order_object& order, const asset& p
 
    const account_object& seller = order.seller(*this);
 
+   // TODO: Revert the following code to before BSIP74: limit order does not pay extra
    asset issuer_fees;
    if (!is_maker && is_margin_call)
       issuer_fees = pay_margin_fees(pays.asset_id(*this), receives );
@@ -930,6 +934,7 @@ bool database::fill_call_order( const call_order_object& order, const asset& pay
    const asset_bitasset_data_object& bitasset = mia.bitasset_data(*this);
 
    // calculate any margin call fees NOTE: Paid in collateral asset
+   // TODO: BSIP74: Correctly calculate margin fee as filled_debt * MCFR / feed_price = pays * MCFR / feed_price; alternatively, get it passed in as a function parameter
    asset margin_fee = asset(0);
    if (!is_maker && is_margin_call)
       margin_fee = pay_margin_fees(mia, pays);
@@ -1122,6 +1127,7 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
     // looking for limit orders selling the most USD for the least CORE
     auto max_price = price::max( mia.id, bitasset.options.short_backing_asset );
     // stop when limit orders are selling too little USD for too much CORE
+    // TODO: BSIP74: Change the min_price = feed_price / (MSSR-MCFR) (instead of the current feed_price / MSSR)
     auto min_price = get_max_short_squeeze_price( maint_time, bitasset.current_feed);
 
     // NOTE limit_price_index is sorted from greatest to least
@@ -1185,6 +1191,7 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
           return margin_called;
 
        const limit_order_object& limit_order = *limit_itr;
+       // TODO: BSIP74: Change the match_price = feed_price / (MSSR-MCFR); the call order will be an effective price with fee of feed_price / MSSR
        price match_price  = limit_order.sell_price;
        // There was a check `match_price.validate();` here, which is removed now because it always passes
 
@@ -1266,12 +1273,14 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
           }
        }
 
+       // TODO: BSIP74: Change what the calls pays to be X*(MSSR)/feed_price
        call_pays  = limit_receives;
        limit_pays = call_receives;
 
        if( filled_call && before_core_hardfork_343 )
           ++call_price_itr;
        // when for_new_limit_order is true, the call order is maker, otherwise the call order is taker
+       // TODO: BSIP74: Pass the calculated margin call fee into fill_call_order()
        fill_call_order( call_order, call_pays, call_receives, match_price, for_new_limit_order, true);
        if( !before_core_hardfork_1270 )
           call_collateral_itr = call_collateral_index.lower_bound( call_min );
