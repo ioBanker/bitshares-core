@@ -1491,38 +1491,6 @@ void adjust_mcfr( database_fixture& fixture, const account_object& owner, const 
       fixture.trx.clear();   
 }
 
-BOOST_AUTO_TEST_CASE( calculate_margin_fee_test )
-{
-   try
-   {
-      ACTORS( (charlie) (feeder1) (feeder2) (feeder3) )
-      const asset_id_type core_id;
-
-      BOOST_TEST_MESSAGE("Advancing past Hardfork BSIP74"); 
-      generate_blocks( HARDFORK_CORE_BSIP74_TIME + 10);
-      set_expiration( db, trx );      
-      
-      // first create the asset
-      asset_id_type my_asset_id = create_jmjcoin( *this, charlie_id, charlie_private_key, feeder1, feeder2, feeder3 );
-      const asset_object& my_asset = my_asset_id(db);
-
-      // no feeds, no mcfr
-      BOOST_CHECK_EQUAL( db.calculate_margin_fee(my_asset, asset(100, core_id)).amount.value, 0 );
-      // 5% mcfr, but no feed
-      adjust_mcfr( *this, charlie, charlie_private_key, my_asset, 1050 );
-      BOOST_CHECK_EQUAL( db.calculate_margin_fee(my_asset, asset(100, core_id)).amount.value, 0 );
-      // add feed (fee still at 5%)
-      publish_feed_jmjcoin( *this, price( asset(1, my_asset_id), asset(1, core_id) ), feeder1, feeder2, feeder3);
-      BOOST_CHECK_EQUAL( db.calculate_margin_fee(my_asset, asset(100, core_id)).amount.value, 5 );
-      // adjust MCFR to be equal to MSSR
-      adjust_mcfr( *this, charlie, charlie_private_key, my_asset, 1500 );
-      BOOST_CHECK_EQUAL( db.calculate_margin_fee(my_asset, asset(100, core_id)).amount.value, 49 );
-      // adjust MCFR to be greater than MSSR (should not change fee)
-      adjust_mcfr( *this, charlie, charlie_private_key, my_asset, 1600 );
-      BOOST_CHECK_EQUAL( db.calculate_margin_fee(my_asset, asset(100, core_id)).amount.value, 49 );
-   }
-   FC_LOG_AND_RETHROW()
-}
 
 /**
  * In this test, the limit order is the maker, and the call is the taker.

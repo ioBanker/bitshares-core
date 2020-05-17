@@ -99,6 +99,84 @@ struct bitasset_database_fixture : database_fixture {
 BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
 
    /**
+    * Test calculating the margin fee from filled_debt, the reference price, and fraction divisor
+    */
+   BOOST_AUTO_TEST_CASE(calculate_margin_fee_test) {
+      try {
+         ACTORS((charlie))
+         const asset_id_type core_id;
+
+         BOOST_TEST_MESSAGE("Advancing past Hardfork BSIP74");
+         generate_blocks(HARDFORK_CORE_BSIP74_TIME);
+         generate_block();
+         set_expiration(db, trx);
+
+         //////
+         // Initialize
+         //////
+         asset filled_debt;
+         asset margin_fee_collateral;
+         price match_price;
+         uint16_t mcfr;
+
+         const asset_object core = core_id(db);
+         const uint16_t smartbit_market_fee_percent = 2 * GRAPHENE_1_PERCENT;
+         create_bitasset("SMARTBIT2", charlie.id, smartbit_market_fee_percent, charge_market_fee, 2); //, core_id, GRAPHENE_MAX_SHARE_SUPPLY, {}, smartbit_margin_call_fee_ratio);
+         generate_block();
+         const asset_object smartbit2 = get_asset("SMARTBIT2");
+         // const asset_id_type smartbit2_id = smartbit2.id;
+         BOOST_CHECK_EQUAL(2, smartbit2.precision);
+         const int64_t smartbit2_unit
+                 = asset::scaled_precision(smartbit2.precision).value; // 100 satoshi SMARTBIT2 in 1 SMARTBIT2
+
+         //////
+         // Check the fee when MCFR equals 0%
+         //////
+         filled_debt = smartbit2.amount(100 * smartbit2_unit);
+         // Price of 1 satoshi SMARTBIT2 for 20 satoshi Core
+         // -> 0.01 SMARTBIT2 for 0.00020 Core = 100 SMARTBIT2 for 2 Core = 50 SMARTBIT2 for 1 Core
+         match_price = smartbit2.amount(1) / core.amount(20);
+         mcfr = 0;
+         margin_fee_collateral = graphene::chain::detail::calculate_collateral(filled_debt, mcfr, match_price);
+
+         BOOST_CHECK_EQUAL(0, margin_fee_collateral.amount.value);
+         BOOST_CHECK(core_id == margin_fee_collateral.asset_id);
+
+
+         //////
+         // Check the fee when MCFR equals 5%
+         //////
+         filled_debt = smartbit2.amount(100 * smartbit2_unit);
+         // Price of 1 satoshi SMARTBIT2 for 20 satoshi Core
+         // -> 0.01 SMARTBIT2 for 0.00020 Core = 100 SMARTBIT2 for 2 Core = 50 SMARTBIT2 for 1 Core
+         match_price = smartbit2.amount(1) / core.amount(20);
+         mcfr = 50;
+         margin_fee_collateral = graphene::chain::detail::calculate_collateral(filled_debt, mcfr, match_price);
+
+         // 100 SMARTBIT2 / (50 SMARTBIT2 / 1 Core) * 5% = 2 Core * 5% = 0.1 Core = 10000 satoshi Core
+         BOOST_CHECK_EQUAL(10000, margin_fee_collateral.amount.value);
+         BOOST_CHECK(core_id == margin_fee_collateral.asset_id);
+
+
+         //////
+         // Check the fee when MCFR equals 5% when the price is defined in an inverted form
+         //////
+         filled_debt = smartbit2.amount(100 * smartbit2_unit);
+         // Price of 1 satoshi SMARTBIT2 for 20 satoshi Core
+         match_price = core.amount(20) / smartbit2.amount(1); // Inverted price
+         mcfr = 50;
+         margin_fee_collateral = graphene::chain::detail::calculate_collateral(filled_debt, mcfr, match_price);
+
+         // 100 SMARTBIT2 / (50 SMARTBIT2 / 1 Core) * 5% = 2 Core * 5% = 0.1 Core = 10000 satoshi Core
+         BOOST_CHECK_EQUAL(10000, margin_fee_collateral.amount.value);
+         BOOST_CHECK(core_id == margin_fee_collateral.asset_id);
+
+      }
+      FC_LOG_AND_RETHROW()
+   }
+
+
+   /**
     * Test a simple scenario of a Complete Fill of a Call Order as a Maker after HF
     *
     * 0. Advance to HF
@@ -337,8 +415,8 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
 
          // Check the asset owner's accumulated asset fees
          BOOST_CHECK(smartbit.dynamic_asset_data_id(db).accumulated_fees == 0);
-         BOOST_CHECK(smartbit.dynamic_asset_data_id(db).accumulated_collateral_fees ==
-                     expected_margin_call_fee.amount.value);
+         BOOST_CHECK_EQUAL(smartbit.dynamic_asset_data_id(db).accumulated_collateral_fees.value,
+                           expected_margin_call_fee.amount.value);
 
       } FC_LOG_AND_RETHROW()
    }

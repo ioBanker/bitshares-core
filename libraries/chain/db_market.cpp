@@ -53,6 +53,39 @@ namespace detail {
       return static_cast<int64_t>(a);
    }
 
+   asset calculate_collateral(const asset &filled_debt, const uint16_t &ratio_divisor, const price &reference_price) {
+      // Edge case of zero ratio divisor
+      if (ratio_divisor == 0) {
+         if( filled_debt.asset_id == reference_price.base.asset_id )
+         {
+            return asset(0, reference_price.quote.asset_id );
+         }
+         else if( filled_debt.asset_id == reference_price.quote.asset_id )
+         {
+            return asset(0, reference_price.base.asset_id );
+         }
+         FC_THROW_EXCEPTION( fc::assert_exception, "incompatible calculate_margin_fee",
+                             ("filled_debt", filled_debt)("reference_price", reference_price) );
+      }
+
+      // fee = filled_debt * ratio / price = filled_debt (price / ratio)
+
+      // The arithmetic expects that the asset type of the denominator of the price (quote of the price object)
+      // is the same as the asset type of the filled_debt.
+      price a;
+      if (filled_debt.asset_id == reference_price.base.asset_id) {
+         a = reference_price * ratio_type(GRAPHENE_COLLATERAL_RATIO_DENOM, ratio_divisor);
+      } else {
+         a = reference_price * ratio_type(ratio_divisor, GRAPHENE_COLLATERAL_RATIO_DENOM);
+      }
+
+      // The multiply_and_round_up function intelligently corrects the multiplication by inverting the price
+      // if necessary to ensure that the asset type of a's denominator is the same as that of filled_debt
+      asset fee = filled_debt.multiply_and_round_up(a);
+
+      return fee;
+   }
+
 } //detail
 
 /**
@@ -521,7 +554,9 @@ bool database::apply_order(const limit_order_object& new_order_object, bool allo
             int match_result = match( new_order_object, *call_itr, call_match_price,
                                       sell_abd->current_feed.settlement_price,
                                       sell_abd->current_feed.maintenance_collateral_ratio,
-                                      sell_abd->current_maintenance_collateralization );
+                                      sell_abd->current_maintenance_collateralization,
+                                      sell_abd->current_feed.maximum_short_squeeze_ratio, // TODO: BSIP75 should update this line
+                                      sell_abd->options.extensions.value.margin_call_fee_ratio);
             // match returns 1 or 3 when the new order was fully filled. In this case, we stop matching; otherwise keep matching.
             // since match can return 0 due to BSIP38 (hard fork core-834), we no longer only check if the result is 2.
             if( match_result == 1 || match_result == 3 )
@@ -653,7 +688,9 @@ int database::match( const limit_order_object& usd, const limit_order_object& co
 
 int database::match( const limit_order_object& bid, const call_order_object& ask, const price& match_price,
                      const price& feed_price, const uint16_t maintenance_collateral_ratio,
-                     const optional<price>& maintenance_collateralization )
+                     const optional<price>& maintenance_collateralization,
+                     const optional<uint16_t>& max_short_squeeze_ratio,
+                     const optional<uint16_t>& margin_call_fee_ratio )
 {
    FC_ASSERT( bid.sell_asset_id() == ask.debt_type() );
    FC_ASSERT( bid.receive_asset_id() == ask.collateral_type() );
@@ -688,14 +725,41 @@ int database::match( const limit_order_object& bid, const call_order_object& ask
       order_receives = usd_to_buy.multiply_and_round_up( match_price ); // round up here, in favor of limit order
    }
 
-   // TODO: BSIP74: Call order must pay X*MSSR/feed_price > match_price = X*(MSSR-MCFR)/feed_price
-   call_pays  = order_receives;
+   if (head_block_time() <= HARDFORK_CORE_BSIP74_TIME) {
+      call_pays = order_receives;
+   } else {
+      // BSIP74: Call receives whatever was calculated above
+      // BSIP74: Call order must pay (X*MSSR/feed_price)
+      const uint16_t mssr = max_short_squeeze_ratio.valid() ? *max_short_squeeze_ratio
+                                                            : GRAPHENE_COLLATERAL_RATIO_DENOM;
+      call_pays = graphene::chain::detail::calculate_collateral(call_receives, mssr, feed_price);
+
+      // BSIP74: Limit order must receive X*(MSSR-MCFR)/feed_price
+      const uint16_t mcfr = margin_call_fee_ratio.valid() ? *margin_call_fee_ratio : 0;
+      const uint16_t delta = mssr > mcfr ? (mssr - mcfr) : GRAPHENE_COLLATERAL_RATIO_DENOM;
+      order_receives = graphene::chain::detail::calculate_collateral(call_receives, delta, feed_price);
+
+      if (call_pays != order_receives) {
+         wdump((""));
+         wdump((""));
+         wdump(("BSIP74 Diff A1")(call_pays)(order_receives)((call_pays - order_receives)));
+         wdump((""));
+         wdump((""));
+      }
+   }
    order_pays = call_receives;
 
    int result = 0;
-   result |= fill_limit_order( bid, order_pays, order_receives, cull_taker, match_price, false, true );
-   // TODO: BSIP74: Pass the calculated margin call fee into fill_call_order()
-   result |= fill_call_order( ask, call_pays, call_receives, match_price, true ) << 1;      // the call order is maker
+   result |= fill_limit_order( bid, order_pays, order_receives, cull_taker, match_price, false );
+
+   // BSIP74: Difference between what the call order pays and the limit order receives is the margin call fee
+   // that is paid by the call order owner.
+   // Margin call fee should equal = X*MCFR/price
+   // but rounding errors of one or two satoshi is less precise than calculating the direct delta
+   FC_ASSERT(call_pays >= order_receives);
+   const asset& margin_call_fee = call_pays - order_receives;
+
+   result |= fill_call_order( ask, call_pays, call_receives, match_price, true, margin_call_fee ) << 1; // the call order is maker
    // result can be 0 when call order has target_collateral_ratio option set.
 
    return result;
@@ -804,7 +868,7 @@ asset database::match( const call_order_object& call,
 } FC_CAPTURE_AND_RETHROW( (call)(settle)(match_price)(max_settlement) ) }
 
 bool database::fill_limit_order( const limit_order_object& order, const asset& pays, const asset& receives, bool cull_if_small,
-                           const price& fill_price, const bool is_maker, bool is_margin_call )
+                           const price& fill_price, const bool is_maker)
 { try {
    cull_if_small |= (head_block_time() < HARDFORK_555_TIME);
 
@@ -914,11 +978,11 @@ bool database::fill_limit_order( const limit_order_object& order, const asset& p
  * @param receives what the call order will receive from the other party (debt)
  * @param fill_price the price at which the call order will execute
  * @param is_maker TRUE if the call order is the maker, FALSE if it is the taker
- * @param is_margin_call TRUE if this method was called due to a margin call
+ * @param margin_call_fee Margin call fees paid in collateral asset
  * @returns TRUE if the call order was completely filled
  */
 bool database::fill_call_order( const call_order_object& order, const asset& pays, const asset& receives,
-      const price& fill_price, const bool is_maker, bool is_margin_call )
+      const price& fill_price, const bool is_maker, const asset& margin_call_fee )
 { try {
    FC_ASSERT( order.debt_type() == receives.asset_id );
    FC_ASSERT( order.collateral_type() == pays.asset_id );
@@ -929,17 +993,11 @@ bool database::fill_call_order( const call_order_object& order, const asset& pay
    FC_ASSERT( mia.is_market_issued() );
    const asset_bitasset_data_object& bitasset = mia.bitasset_data(*this);
 
-   // calculate any margin call fees NOTE: Paid in collateral asset
-   // TODO: BSIP74: Correctly calculate margin fee as filled_debt * MCFR / feed_price = pays * MCFR / feed_price; alternatively, get it passed in as a function parameter
-   asset margin_fee = asset(0);
-   if (!is_maker && is_margin_call)
-      margin_fee = pay_margin_fees(mia, pays);
-
    optional<asset> collateral_freed;
    // adjust the order
    modify( order, [&]( call_order_object& o ) {
          o.debt       -= receives.amount;
-         o.collateral -= pays.amount + margin_fee.amount;
+         o.collateral -= pays.amount;
          if( o.debt == 0 ) // is the whole debt paid?
          {
             collateral_freed = o.get_collateral();
@@ -971,17 +1029,20 @@ bool database::fill_call_order( const call_order_object& order, const asset& pay
    // Update account statistics. We know that order.collateral_type() == pays.asset_id
    if( pays.asset_id == asset_id_type() )
    {
-      modify( get_account_stats_by_owner(order.borrower), 
-            [&collateral_freed,&pays,&margin_fee]( account_statistics_object& b ){
-         b.total_core_in_orders -= pays.amount + margin_fee.amount;
+      modify( get_account_stats_by_owner(order.borrower), [&collateral_freed,&pays]( account_statistics_object& b ){
+         b.total_core_in_orders -= pays.amount;
          if( collateral_freed.valid() )
             b.total_core_in_orders -= collateral_freed->amount;
       });
    }
 
+   // BSIP74: Accumulate the collateral-denominated fee
+   if (margin_call_fee.amount.value != 0)
+      mia.accumulate_fee(*this, margin_call_fee);
+
    // virtual operation for account history
    push_applied_operation( fill_order_operation( order.id, order.borrower, pays, receives,
-         margin_fee, fill_price, is_maker ) );
+         margin_call_fee, fill_price, is_maker ) );
 
    // Call order completely filled, remove it
    if( collateral_freed.valid() )
@@ -1293,15 +1354,41 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
           }
        }
 
-       // TODO: BSIP74: Change what the calls pays to be X*(MSSR)/feed_price
-       call_pays  = limit_receives;
+       if (head_block_time() <= HARDFORK_CORE_BSIP74_TIME) {
+          call_pays = limit_receives;
+       } else {
+          // BSIP74: Call receives whatever was calculated above
+          // BSIP74: Call order must pay (X*MSSR/feed_price)
+          uint16_t mssr = bitasset.current_feed.maximum_short_squeeze_ratio; // TODO: BSIP75 should update this line
+          call_pays = graphene::chain::detail::calculate_collateral(call_receives, mssr,
+                                                                    bitasset.current_feed.settlement_price);
+
+          // BSIP74: Limit order must receive X*(MSSR-MCFR)/feed_price
+          const optional<uint16_t> mcfr_optional = bitasset.options.extensions.value.margin_call_fee_ratio;
+          const uint16_t mcfr = mcfr_optional.valid() ? *mcfr_optional : 0;
+          const uint16_t delta = mssr > mcfr ? (mssr - mcfr) : GRAPHENE_COLLATERAL_RATIO_DENOM;
+          limit_receives = graphene::chain::detail::calculate_collateral(call_receives, delta,
+                                                                         bitasset.current_feed.settlement_price);
+
+          if (call_pays != limit_receives) {
+             wdump((""));
+             wdump((""));
+             wdump(("BSIP74 Diff A2")(call_pays)(limit_receives)((call_pays - limit_receives)));
+             wdump((""));
+             wdump((""));
+          }
+       }
        limit_pays = call_receives;
 
        if( filled_call && before_core_hardfork_343 )
           ++call_price_itr;
        // when for_new_limit_order is true, the call order is maker, otherwise the call order is taker
-       // TODO: BSIP74: Pass the calculated margin call fee into fill_call_order()
-       fill_call_order( call_order, call_pays, call_receives, match_price, for_new_limit_order, true);
+       // BSIP74: Pass the calculated margin call fee into fill_call_order()
+       // Margin call fee should equal = X*MCFR/price
+       // but rounding errors of one or two satoshi is less precise than calculating the direct delta
+       FC_ASSERT(call_pays >= limit_receives);
+       const asset& margin_call_fee = call_pays - limit_receives;
+       fill_call_order( call_order, call_pays, call_receives, match_price, for_new_limit_order, margin_call_fee);
        if( !before_core_hardfork_1270 )
           call_collateral_itr = call_collateral_index.lower_bound( call_min );
        else if( !before_core_hardfork_343 )
@@ -1363,38 +1450,6 @@ asset database::calculate_market_fee( const asset_object& trade_asset, const ass
    return percent_fee;
 }
 
-/**
- * @brief Calculate the margin fee that is to be taken
- * @param debt the indebted asset
- * @param collateral the amount of collateral received (before fees)
- * @returns the amount of fee that should be collected
- */
-asset database::calculate_margin_fee(const asset_object& debt, const asset& collateral)const
-{
-   auto ba = debt.bitasset_data(*this);
-   auto price_feed = ba.current_feed;
-   if ( price_feed.settlement_price.is_null() 
-         || price_feed.settlement_price.base.amount == 0
-         || !ba.options.extensions.value.margin_call_fee_ratio.valid())
-      return asset(0);
-   auto ratio = ba.adjusted_mcfr(price_feed);
-   auto amount = detail::calculate_ratio( collateral.amount, ratio );
-   return asset(amount, collateral.asset_id) ;
-}
-
-/****
- * @brief calculate the margin fee and distribute it
- * @param debt_asset the indebted asset
- * @param collarteral the amount of the collateral
- * @returns the amount of the fee that was collected
- */ 
-asset database::pay_margin_fees(const asset_object& debt_asset, const asset& collateral)
-{
-   const auto margin_fees = calculate_margin_fee( debt_asset, collateral );
-   if (margin_fees.amount.value != 0)
-      debt_asset.accumulate_fee(*this, margin_fees);
-   return margin_fees;
-}
 
 asset database::pay_market_fees(const account_object* seller, const asset_object& recv_asset, const asset& receives,
                                 const bool& is_maker)
