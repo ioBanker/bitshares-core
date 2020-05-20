@@ -736,8 +736,10 @@ int database::match( const limit_order_object& bid, const call_order_object& ask
 
       // BSIP74: Limit order must receive X*(MSSR-MCFR)/feed_price
       const uint16_t mcfr = margin_call_fee_ratio.valid() ? *margin_call_fee_ratio : 0;
-      const uint16_t delta = mssr > mcfr ? (mssr - mcfr) : GRAPHENE_COLLATERAL_RATIO_DENOM;
-      order_receives = graphene::chain::detail::calculate_collateral(call_receives, delta, feed_price);
+      // Mathematically floor the divisor at 1
+      // Expressed in this codebase: floor the value at GRAPHENE_COLLATERAL_RATIO_DENOM
+      const uint16_t price_divisor = (mssr - mcfr) > GRAPHENE_COLLATERAL_RATIO_DENOM ? (mssr - mcfr) : GRAPHENE_COLLATERAL_RATIO_DENOM;
+      order_receives = graphene::chain::detail::calculate_collateral(call_receives, price_divisor, feed_price);
 
       if (call_pays != order_receives) {
          wdump((""));
@@ -1148,9 +1150,12 @@ price database::get_max_short_squeeze_price(const fc::time_point_sec& head_block
 
       // Mathematically floor the difference at 1
       // Expressed in this codebase: floor the value at GRAPHENE_COLLATERAL_RATIO_DENOM
-      const uint16_t delta = mssr > mcfr ? (mssr - mcfr) : GRAPHENE_COLLATERAL_RATIO_DENOM;
-      if (delta > GRAPHENE_COLLATERAL_RATIO_DENOM) {
-         return feed.settlement_price * ratio_type( GRAPHENE_COLLATERAL_RATIO_DENOM, delta);
+      const uint16_t price_divisor =
+              (mssr - mcfr) > GRAPHENE_COLLATERAL_RATIO_DENOM ? (mssr - mcfr) : GRAPHENE_COLLATERAL_RATIO_DENOM;
+
+      // Optimization
+      if (price_divisor > GRAPHENE_COLLATERAL_RATIO_DENOM) {
+         return feed.settlement_price * ratio_type( GRAPHENE_COLLATERAL_RATIO_DENOM, price_divisor);
 
       } else {
          // Optimization: The effect of mathematically flooring at 1 is to return the settlement_price
