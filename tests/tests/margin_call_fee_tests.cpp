@@ -421,4 +421,274 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
       } FC_LOG_AND_RETHROW()
    }
 
+   /**
+    * Test a simple scenario of a Complete Fill of a Call Order as a Taker after HF
+    *
+    * 0. Advance to HF
+    * 1. Initialize actors, a smart asset called SMARTBIT
+    * 2. Publish feed
+    * 3. (Order 1: Limit order) Alice places a **"large"** limit order to sell SMARTBIT
+    * 4. (Order 2: Call order) Bob borrows a **"small"** amount of SMARTBIT into existence.
+    *     Bob retains the asset in his own balances, or transfers it, or sells it is not critical
+    *     because his debt position is what will be tracked.
+    * 5. The feed price indicates that the collateral drops enough to trigger a margin call
+    *    **and** enough to be matched against Alice's limit order (MSSR*feed_price<sub>new</sub>
+    *    to overlap with Alice's price).
+    *    (Global settlement is not at risk because Bob's small order should be matched
+    *    and completely filled by Alice's large order).
+    *    Alice's limit order should be matched against Bob's "activated" call order.
+    *    **Alice should be charged as a maker, and Bob as a taker.**
+    *    Alice's limit order should be partially filled,
+    *    but Bob's order should be completely filled and removed from the book.
+    */
+   BOOST_AUTO_TEST_CASE(complete_fill_of_call_order_as_taker) {
+      try {
+         //////
+         // 0. Advance to activate hardfork
+         //////
+         BOOST_TEST_MESSAGE("Advancing past Hardfork BSIP74");
+         generate_blocks(HARDFORK_CORE_BSIP74_TIME);
+         generate_block();
+         set_expiration(db, trx);
+
+
+         //////
+         // 1. Initialize actors, a UIA called JCOIN, a smart asset called SMARTBIT
+         //////
+         // Initialize for the current time
+         trx.clear();
+         set_expiration(db, trx);
+
+         // Initialize actors
+         ACTORS((alice)(bob)(charlie));
+         ACTORS((smartissuer)(feedproducer));
+
+         // Initialize tokens
+         // CORE asset exists by default
+         const asset_object &core = asset_id_type()(db);
+         const asset_id_type core_id = core.id;
+         const int64_t CORE_UNIT = asset::scaled_precision(core.precision).value; // 100000 satoshi CORE in 1 CORE
+
+         // Create the SMARTBIT asset
+         const int16_t SMARTBIT_UNIT = 10000; // 10000 satoshi SMARTBIT in 1 SMARTBIT
+         const uint16_t smartbit_market_fee_percent = 2 * GRAPHENE_1_PERCENT;
+         const uint16_t smartbit_margin_call_fee_ratio = 50; // 5% expressed in terms of GRAPHENE_COLLATERAL_RATIO_DENOM
+         // Define the margin call fee ratio
+         create_bitasset("SMARTBIT", smartissuer.id, smartbit_market_fee_percent, charge_market_fee, 4, core_id,
+                         GRAPHENE_MAX_SHARE_SUPPLY, {}, smartbit_margin_call_fee_ratio);
+         // Obtain asset object after a block is generated to obtain the final object that is commited to the database
+         generate_block();
+         const asset_object smartbit = get_asset("SMARTBIT");
+         const asset_id_type smartbit_id = smartbit.id;
+         update_feed_producers(smartbit, {feedproducer.id});
+
+         // Initialize token balance of actors
+
+         // Alice should start with enough CORE to back 5000 SMARTBIT subject to
+         // (a) to an initial price feed of 1 satoshi SMARTBIT for 20 satoshi CORE
+         // = 0.0001 SMARTBIT for 0.00020 CORE = 1 SMARTBIT for 2 CORE
+         // (b) an initial collateral ratio of 4x
+         const price initial_feed_price =
+                 smartbit.amount(1) / core.amount(20); // 1 satoshi SMARTBIT for 20 satoshi CORE
+         const asset alice_initial_smart = smartbit.amount(500 * SMARTBIT_UNIT); // 5,000,000 satoshi SMARTBIT
+         const asset alice_initial_core = core.amount(
+                 4 * (alice_initial_smart * initial_feed_price).amount); // 400,000,000 satoshi CORE
+         transfer(committee_account, alice.id, alice_initial_core);
+         BOOST_CHECK_EQUAL(get_balance(alice_id, core_id), alice_initial_core.amount.value);
+
+         // Bob should start with enough CORE to back 200 SMARTBIT subject to
+         // (a) to an initial price feed of 1 satoshi SMARTBIT for 20 satoshi CORE
+         // = 0.0001 SMARTBIT for 0.00020 CORE = 1 SMARTBIT for 2 CORE
+         // (b) an initial collateral ratio of 2x
+         const asset bob_initial_smart = smartbit.amount(200 * SMARTBIT_UNIT); // 2,000,000 satoshi SMARTBIT
+         const asset bob_initial_core = core.amount(
+                 2 * (bob_initial_smart * initial_feed_price).amount); // 80,000,000 satoshi CORE
+         transfer(committee_account, bob.id, bob_initial_core);
+         BOOST_REQUIRE_EQUAL(get_balance(bob, core), 80000000);
+
+         // In Step 5, the feed price will be adjusted such that
+         // the initial CR of Bob's position (CR_0) drops to 1.7x = (17/10)x
+         // Want new price = 1.7 / CR_0 = (17/10) / CR_0
+         //
+         // Collateral ratios are defined as collateral / debt
+         // BitShares prices are conventionally defined as debt / collateral
+         // The new price can be expressed with the available codebase as
+         // = (17/10) * ~CR_0 = ~CR_0 * (17/10)
+         const price expected_bob_initial_cr =
+                 core.amount(2 * 20) / smartbit.amount(1); // 1 satoshi SMARTBIT for 40 satoshi CORE
+         const price intermediate_feed_price =
+                 ~expected_bob_initial_cr * ratio_type(17, 10); // Units of debt / collateral
+         // Reduces to (2000000 * 17) / (80000000 * 10) = (17) / (40 * 10) = 17 satoshi SMARTBIT / 400 satoshi CORE
+         BOOST_CHECK_EQUAL(intermediate_feed_price.base.amount.value, 17); // satoshi SMARTBIT
+         BOOST_CHECK_EQUAL(intermediate_feed_price.quote.amount.value, 400); // satoshi CORE
+         BOOST_CHECK(intermediate_feed_price < initial_feed_price);
+
+
+         //////
+         // 2. Publish feed
+         //////
+         price_feed current_feed;
+         current_feed.settlement_price = initial_feed_price;
+         current_feed.maintenance_collateral_ratio = 1750; // MCR of 1.75x
+         current_feed.maximum_short_squeeze_ratio = 1500; // MSSR of 1.50x
+         publish_feed(smartbit, feedproducer, current_feed);
+         FC_ASSERT(smartbit.bitasset_data(db).current_feed.settlement_price == current_feed.settlement_price);
+
+
+         //////
+         // 3. (Order 1: Limit order) Alice places a **"large"** limit order to sell SMARTBIT.
+         //////
+         // Alice borrows SMARTBIT
+         call_order_id_type alice_call_id = (*borrow(alice, alice_initial_smart, alice_initial_core)).id;
+         BOOST_CHECK_EQUAL(get_balance(alice_id(db), smartbit_id(db)), 500 * SMARTBIT_UNIT);
+         BOOST_CHECK_EQUAL(get_balance(alice_id, core_id), 0 * CORE_UNIT);
+         BOOST_CHECK(!smartbit.bitasset_data(db).has_settlement()); // No global settlement
+
+         // Alice offer to sell the SMARTBIT
+         // Create a "large" sell order at a "high" price of feed_price * 1.1 = feed_price * (11/10)
+         const price alice_order_price_implied = intermediate_feed_price * ratio_type(11, 10);
+         // = (17 satoshi SMARTBIT / 400 satoshi CORE) * (11/10)
+         // = 187 satoshi SMARTBIT / 4000 satoshi CORE
+         BOOST_CHECK_EQUAL(alice_order_price_implied.base.amount.value, 187); // satoshi SMARTBIT
+         BOOST_CHECK_EQUAL(alice_order_price_implied.quote.amount.value, 4000); // satoshi CORE
+
+         const asset alice_debt_to_sell = smartbit.amount(get_balance(alice_id(db), smartbit_id(db)));
+         // multiply_and_round_up() handles inverting the price so that the output is in correct collateral units
+         const asset alice_collateral_to_buy = alice_debt_to_sell.multiply_and_round_up(alice_order_price_implied);
+         limit_order_create_operation alice_sell_op = create_sell_operation(alice_id, alice_debt_to_sell,
+                                                                            alice_collateral_to_buy);
+         trx.clear();
+         trx.operations.push_back(alice_sell_op);
+         // asset alice_sell_fee = db.current_fee_schedule().set_fee(trx.operations.back());
+         sign(trx, alice_private_key);
+         processed_transaction ptx = PUSH_TX(db, trx); // No exception should be thrown
+         limit_order_id_type alice_order_id = ptx.operation_results[0].get<object_id_type>();
+
+         // Alice should have no balance
+         BOOST_CHECK_EQUAL(get_balance(alice_id(db), smartbit_id(db)), 0 * SMARTBIT_UNIT);
+         BOOST_CHECK_EQUAL(get_balance(alice_id, core_id), 0 * CORE_UNIT);
+
+
+         //////
+         // 4. (Order 2: Call order) Bob borrows a **"small"** amount of SMARTBIT into existence.
+         //    Bob retains the asset in his own balances, or transfers it, or sells it is not critical
+         //    because his debt position is what will be tracked.
+         //////
+         const asset bob_initial_debt_smart = bob_initial_smart;
+         const asset bob_initial_debt_collateral = bob_initial_core;
+         call_order_id_type bob_call_id = (*borrow(bob, bob_initial_debt_smart, bob_initial_debt_collateral)).id;
+
+         // Bobs's balances should reflect that CORE was used to create SMARTBIT
+         BOOST_CHECK_EQUAL(get_balance(bob_id, smartbit_id), 200 * SMARTBIT_UNIT);
+         BOOST_CHECK_EQUAL(get_balance(bob_id, core_id), 0);
+         BOOST_CHECK(!smartbit.bitasset_data(db).has_settlement()); // No global settlement
+         const price bob_initial_cr = bob_call_id(db).collateralization(); // Units of collateral / debt
+         BOOST_CHECK(bob_initial_cr == expected_bob_initial_cr);
+         BOOST_CHECK_EQUAL(bob_initial_cr.base.amount.value, 80000000); // Collateral of 80,000,000 satoshi CORE
+         BOOST_CHECK_EQUAL(bob_initial_cr.quote.amount.value, 2000000); // Debt of 2,000,000 satoshi SMARTBIT
+
+         // Alice's balances should not have changed
+         BOOST_REQUIRE_EQUAL(get_balance(alice_id(db), smartbit_id(db)), 0 * SMARTBIT_UNIT);
+         BOOST_REQUIRE_EQUAL(get_balance(alice_id, core_id), 0 * CORE_UNIT);
+
+         // Alice should not have been margin called
+         price alice_initial_cr = alice_call_id(db).collateralization(); // Units of collateral / debt
+         BOOST_CHECK_EQUAL(alice_initial_cr.base.amount.value, 400000000); // Collateral of 400,000,000 satoshi CORE
+         BOOST_CHECK_EQUAL(alice_initial_cr.quote.amount.value, 5000000); // Debt of 5,000,000 satoshi SMARTBIT
+
+         //////
+         // Bob transfers hist SMARTBIT to Charlie to clarify the accounting
+         //////
+         transfer(bob_id, charlie_id, bob_initial_smart);
+         BOOST_CHECK_EQUAL(get_balance(bob_id, smartbit_id), 0 * SMARTBIT_UNIT);
+         BOOST_CHECK_EQUAL(get_balance(bob_id, core_id), 0 * CORE_UNIT);
+         BOOST_CHECK_EQUAL(get_balance(charlie_id, smartbit_id), 200 * SMARTBIT_UNIT);
+         BOOST_CHECK_EQUAL(get_balance(charlie_id, core_id), 0 * CORE_UNIT);
+
+
+         //////
+         // 5. The feed price indicates that the collateral drops enough to trigger a margin call
+         //    **and** enough to be matched against Alice's limit order (MSSR*feed_price<sub>new</sub>
+         //    to overlap with Alice's price).
+         //    (Global settlement is not at risk because Bob's small order should be matched
+         //    and completely filled by Alice's large order).
+         //    Alice's limit order should be matched against Bob's "activated" call order.
+         //    **Alice should be charged as a maker, and Bob as a taker.**
+         //    Alice's limit order should be partially filled,
+         //     but Bob's order should be completely filled and removed from the book.
+         //////
+         current_feed.settlement_price = intermediate_feed_price;
+         publish_feed(smartbit, feedproducer, current_feed);
+         // Confirm the updated feed
+         BOOST_CHECK(smartbit.bitasset_data(db).current_feed.settlement_price == current_feed.settlement_price);
+         // Confirm no global settlement
+         BOOST_CHECK(!smartbit.bitasset_data(db).has_settlement());
+
+
+         // The margin call of Bob's position should have closed the debt of bob_initial_smart
+         // Bob's margin call should been matched against Alice's limit order
+         // Bob's debt position should have paid collateral = bob_initial_smart / limit_order_price
+         // 200 SMARTBIT / (187 satoshi SMARTBIT / 4000 satoshi CORE)
+         // = 2,000,000 satoshi SMARTBIT / (187 satoshi SMARTBIT / 4000 satoshi CORE)
+         // = 2,000,000 satoshi SMARTBIT * (4000 satoshi CORE / 187 satoshi SMARTBIT)
+         // = 2,000,000 satoshi CORE / (4000 / 187)
+         // = 42,780,748.6631 satoshi CORE rounded up to 42,780,749 satoshi CORE
+         const asset expected_margin_call_from_bob_debt_core = core.amount(42780749);
+
+         // Bob's margin call fee, which is paid in collateral, should be charged as a taker
+         // The margin call fee debt = filled_debt * MCFR/(MSSR-MCFR) / limit_order_price
+         // 200 SMARTBIT * (50 / (1500 - 50)) / (187 satoshi SMARTBIT / 4000 satoshi CORE)
+         // = 2,000,000 satoshi SMARTBIT * (50 / 1450) / (187 satoshi SMARTBIT / 4000 satoshi CORE)
+         // = 2,000,000 satoshi CORE * (1 / 29) * (4000 / 187)
+         // = 1475198.22976 satoshi CORE rounded up to 1475199 satoshi CORE
+         const asset expected_margin_call_fee_from_bob_debt_core = core.amount(1475199);
+
+         // The balance of Bob's debt position
+         const asset expected_return_from_bob_debt_core = bob_initial_core
+                                                          - expected_margin_call_from_bob_debt_core
+                                                          - expected_margin_call_fee_from_bob_debt_core;
+
+         // Check Bob's debt position is closed
+         BOOST_CHECK(!db.find(bob_call_id));
+
+         // Check Bob's balances
+         BOOST_CHECK_EQUAL(get_balance(bob_id(db), smartbit_id(db)), 0 * SMARTBIT_UNIT);
+         BOOST_CHECK_EQUAL(get_balance(bob_id(db), core_id(db)), expected_return_from_bob_debt_core.amount.value);
+
+         // TODO: Check Bobs's virtual fill_order_operation fee reflects the margin_call_fee
+
+         // Charlie's balances should not have changed
+         BOOST_CHECK_EQUAL(get_balance(charlie_id, smartbit_id), 200 * SMARTBIT_UNIT);
+         BOOST_CHECK_EQUAL(get_balance(charlie_id, core_id), 0 * CORE_UNIT);
+
+         // Alice's balances should have changed because her limit order was partially filled by the margin call
+         BOOST_CHECK_EQUAL(get_balance(alice_id(db), smartbit_id(db)), 0 * SMARTBIT_UNIT);
+         BOOST_CHECK_EQUAL(get_balance(alice_id, core_id), expected_margin_call_from_bob_debt_core.amount.value);
+
+         // Check Alice's debt
+         // Alice's debt position should not be NOT closed
+         BOOST_CHECK(db.find(alice_call_id));
+         // Alice's debt should NOT have changed because its CR > MCR
+         alice_initial_cr = alice_call_id(db).collateralization(); // Units of collateral / debt
+         BOOST_CHECK_EQUAL(alice_initial_cr.base.amount.value, 400000000); // Collateral of 400,000,000 satoshi CORE
+         BOOST_CHECK_EQUAL(alice_initial_cr.quote.amount.value, 5000000); // Debt of 5,000,000 satoshi SMARTBIT
+
+         // Check Alice's limit order
+         // The amount of smart asset available for sale should be reduced by the amount paid to Bob's margin call
+         limit_order_object alice_limit_order = alice_order_id(db);
+         asset expected_alice_remaining_smart_for_sale = alice_debt_to_sell - bob_initial_debt_smart;
+         asset expected_alice_remaining_core_to_receive =
+                 alice_collateral_to_buy - expected_margin_call_from_bob_debt_core;
+         BOOST_CHECK(alice_limit_order.amount_for_sale() == expected_alice_remaining_smart_for_sale);
+         BOOST_CHECK(alice_limit_order.amount_to_receive() == expected_alice_remaining_core_to_receive);
+
+         // Check the asset owner's accumulated asset fees
+         BOOST_CHECK_EQUAL(smartbit.dynamic_asset_data_id(db).accumulated_fees.value, 0);
+         BOOST_CHECK_EQUAL(smartbit.dynamic_asset_data_id(db).accumulated_collateral_fees.value,
+                           expected_margin_call_fee_from_bob_debt_core.amount.value);
+
+      } FC_LOG_AND_RETHROW()
+   }
+
+
 BOOST_AUTO_TEST_SUITE_END()
