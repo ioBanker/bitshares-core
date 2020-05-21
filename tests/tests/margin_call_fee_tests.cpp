@@ -180,7 +180,7 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
     * Test a simple scenario of a Complete Fill of a Call Order as a Maker after HF
     *
     * 0. Advance to HF
-    * 1. Initialize actors, a smart asset called SMARTBIT
+    * 1. Initialize actors and a smart asset called SMARTBIT
     * 2. Publish feed
     * 3. (Order 1: Call order) Bob borrows a **"small"** amount of SMARTBIT into existence.
     *     Bob retains the asset in his own balances, or transfers it, or sells it is not critical
@@ -191,7 +191,7 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
     * 5. (Order 2: Limit order) Alice places a **"large"** limit order to sell SMARTBIT at a price
     *    that will overlap with Bob's "activated" call order / margin call.
     *    **Bob should be charged as a maker, and Alice as a taker.**
-    *    Alice's limit order should be paritally filled, but Bob's order should be completely filled,
+    *    Alice's limit order should be (partially or completely) filled, but Bob's order should be completely filled,
     *    and the debt position should be closed.
     */
    BOOST_AUTO_TEST_CASE(complete_fill_of_call_order_as_maker) {
@@ -206,7 +206,7 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
 
 
          //////
-         // 1. Initialize actors, a UIA called JCOIN, a smart asset called SMARTBIT
+         // 1. Initialize actors and a smart asset called SMARTBIT
          //////
          // Initialize for the current time
          trx.clear();
@@ -315,7 +315,7 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
          // 5. (Order 2: Limit order) Alice places a **"large"** limit order to sell SMARTBIT at a price
          //    that will overlap with Bob's "activated" call order / margin call.
          //    **Bob should be charged as a maker, and Alice as a taker.**
-         //    Alice's limit order should be paritally filled, but Bob's order should be completely filled,
+         //    Alice's limit order should be (partially or completely) filled, but Bob's order should be completely filled,
          //    and the debt position should be closed.
          //////
          // Alice obtains her SMARTBIT from Bob
@@ -352,7 +352,6 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
          // = (17 satoshi SMARTBIT / 400 satoshi CORE) * (100 / 145)
          // = (17 satoshi SMARTBIT / 4 satoshi CORE) * (1 / 145)
          // = 17 satoshi SMARTBIT / 580 satoshi CORE
-//         BOOST_CHECK(intermediate_feed_price < initial_feed_price);
          BOOST_CHECK_EQUAL(expected_match_price.base.amount.value, 17); // satoshi SMARTBIT
          BOOST_CHECK_EQUAL(expected_match_price.quote.amount.value, 580); // satoshi CORE
 
@@ -398,25 +397,34 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
          BOOST_CHECK_EQUAL(get_balance(bob_id(db), core_id(db)),
                            bob_initial_core.amount.value - expected_payment_from_bob_core.amount.value);
 
-         // Check the virtual fill operation on the limit order include reflects the MCFR effect
-         graphene::app::history_api hist_api(app);
-         flat_set<uint16_t> ops = {0,1,2,3,4}; // Fill operations
-         graphene::app::history_operation_detail hist_detail
-                 = hist_api.get_account_history_by_operations("alice", ops, 0, 10);
-         BOOST_CHECK_EQUAL(hist_detail.total_count, 1);
-         vector <operation_history_object> histories = hist_detail.operation_history_objs;
-         wdump(("A")(histories));
-         for (operation_history_object h : histories) {
-            wdump(("B"));
-            wdump((h.op));
-         }
-         wdump(("Z"));
-
-
          // Check the asset owner's accumulated asset fees
          BOOST_CHECK(smartbit.dynamic_asset_data_id(db).accumulated_fees == 0);
          BOOST_CHECK_EQUAL(smartbit.dynamic_asset_data_id(db).accumulated_collateral_fees.value,
                            expected_margin_call_fee.amount.value);
+
+         // Check the fee of the fill operations for Alice and Bob
+         generate_block(); // To trigger db_notify() and record pending operations into histories
+         graphene::app::history_api hist_api(app);
+         vector <operation_history_object> histories;
+         const int fill_order_op_id = operation::tag<fill_order_operation>::value;
+
+         // Check Alice's history
+         histories = hist_api.get_account_history_operations(
+                 "alice", fill_order_op_id, operation_history_id_type(), operation_history_id_type(), 100);
+         // There should be one fill order operation
+         BOOST_CHECK_EQUAL(histories.size(), 1);
+         // Alice's fill order for her limit order should have zero fee
+         fill_order_operation alice_fill_op = histories.front().op.get<fill_order_operation>();
+         BOOST_CHECK(alice_fill_op.fee == asset(0));
+
+         // Check Bob's history
+         histories = hist_api.get_account_history_operations(
+                 "bob", fill_order_op_id, operation_history_id_type(), operation_history_id_type(), 100);
+         // There should be one fill order operation
+         BOOST_CHECK_EQUAL(histories.size(), 1);
+         // Bob's fill order for his margin call should have a fee equal to the margin call fee
+         fill_order_operation bob_fill_op = histories.front().op.get<fill_order_operation>();
+         BOOST_CHECK(bob_fill_op.fee == expected_margin_call_fee);
 
       } FC_LOG_AND_RETHROW()
    }
