@@ -411,22 +411,29 @@ namespace graphene { namespace chain {
          ///@{
          int match( const limit_order_object& taker, const limit_order_object& maker, const price& trade_price );
          /***
-          * @brief Match the two orders
-          * @param taker the account that is removing liquidity from the book
-          * @param maker the account that put liquidity on the book
+          * @brief Match limit order as taker to a call order as maker
+          * @param taker the order that is removing liquidity from the book
+          * @param maker the order that put liquidity on the book
           * @param trade_price the price the trade should execute at
           * @param feed_price the price of the current feed
           * @param maintenance_collateral_ratio the maintenance collateral ratio
           * @param maintenance_collateralization the maintenance collateralization
-          * @param max_short_squeeze_ratio Maximum short squeeze ratio
-          * @param margin_call_fee_ratio Margin call fee ratio
+          * @param call_pays_price price call order pays. Call order may pay more collateral
+          *    than limit order takes if call order subject to a margin call fee.
           * @returns 0 if no orders were matched, 1 if taker was filled, 2 if maker was filled, 3 if both were filled
           */
          int match( const limit_order_object& taker, const call_order_object& maker, const price& trade_price,
                     const price& feed_price, const uint16_t maintenance_collateral_ratio,
                     const optional<price>& maintenance_collateralization,
-                    const optional<uint16_t>& max_short_squeeze_ratio = {},
-                    const optional<uint16_t>& margin_call_fee_ratio = {});
+                    const price& call_pays_price);
+         // If separate call_pays_price not provided, assume call pays at trade_price:
+         int match( const limit_order_object& taker, const call_order_object& maker, const price& trade_price,
+                    const price& feed_price, const uint16_t maintenance_collateral_ratio,
+                    const optional<price>& maintenance_collateralization) {
+            return match(taker, maker, trade_price, feed_price, maintenance_collateral_ratio,
+                         maintenance_collateralization, trade_price);
+         }
+
          ///@}
 
          /// Matches the two orders, the first parameter is taker, the second is maker.
@@ -664,20 +671,6 @@ namespace graphene { namespace chain {
          const chain_property_object*           _p_chain_property_obj      = nullptr;
          const witness_schedule_object*         _p_witness_schedule_obj    = nullptr;
          ///@}
-         protected:
-         /***
-          * Get the correct max_short_squeeze_price from the price_feed based on chain time
-          * (due to hardfork changes in the calculation)
-          * @param head_block_time The chain's current block time
-          * @param next_maintenance_time The chain's next maintenance time
-          * @param feed the debt asset's price feed
-          * @param margin_call_fee_ratio The MCFR for the debt asset in the respective price feed
-          * @returns the max short squeeze price
-          */
-         price get_max_short_squeeze_price(const fc::time_point_sec& head_block_time,
-                                           const fc::time_point_sec& next_maintenance_time,
-                                           const price_feed& feed,
-                                           const fc::optional<uint16_t> margin_call_fee_ratio = {}) const;
    };
 
    namespace detail

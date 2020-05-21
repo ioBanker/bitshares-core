@@ -204,6 +204,19 @@ namespace graphene { namespace protocol {
       /// Other implementation of max_short_squeeze_price() due to hardfork changes
       price max_short_squeeze_price_before_hf_1270()const;
 
+      /**
+       * Since BSIP-74, we distinguish between Maximum Short Squeeze Price (MSSP) and Margin Call
+       * Offer Price (MCOP). Margin calls previously offered collateral at the MSSP, but now they
+       * offer slightly less collateral per debt if Margin Call Fee Ratio (MCFR) is set, because
+       * the call order must reserve some collateral to pay the fee.  We must still retain the
+       * concept of MSSP, as it communicates the minimum collateralization before black swan may be
+       * triggered, but we add this new method to calculate MCOP.
+       *
+       * @param margin_call_fee_ratio  MCFR value currently in effect. If zero or unset, returns
+       *    same result as @ref max_short_squeeze_price().
+       */
+      price margin_call_offer_price(const fc::optional<uint16_t> margin_call_fee_ratio)const;
+
       /// Call orders with collateralization (aka collateral/debt) not greater than this value are in margin call territory.
       /// Calculation: ~settlement_price * maintenance_collateral_ratio / GRAPHENE_COLLATERAL_RATIO_DENOM
       price maintenance_collateralization()const;
