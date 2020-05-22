@@ -115,10 +115,9 @@ jobs:
     - name: Configure
       run: |
         mkdir -p _build
-        sudo mkdir -p /mnt/libraries /mnt/tests
-        sudo chmod a+rwx /mnt/libraries /mnt/tests
+        sudo mkdir -p /mnt/libraries
+        sudo chmod a+rwx /mnt/libraries
         ln -s /mnt/libraries _build/libraries
-        ln -s /mnt/tests _build/tests
         pushd _build
         export -n BOOST_ROOT BOOST_INCLUDEDIR BOOST_LIBRARYDIR
         cmake -D CMAKE_BUILD_TYPE=Debug \
